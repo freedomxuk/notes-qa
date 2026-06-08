@@ -69,21 +69,33 @@ export default function Home() {
     setIsAsking(true);
     setAnswer('');
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
     try {
-      // 传递所有笔记内容给后端搜索
+      // 限制内容大小，只发送前 10000 字符
+      const MAX_CHARS = 10000;
+      const limitedNotes = notes.map(n => ({
+        id: n.id,
+        filename: n.filename,
+        content: n.content.slice(0, MAX_CHARS),
+      }));
+
       const response = await fetch('/api/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           question: question.trim(),
-          // 传递所有笔记
-          allNotes: notes.map(n => ({
-            id: n.id,
-            filename: n.filename,
-            content: n.content,
-          })),
+          allNotes: limitedNotes,
         }),
+        signal: controller.signal,
       });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
 
       const data = await response.json();
       if (data.error) {
@@ -92,10 +104,11 @@ export default function Home() {
         setAnswer(data.answer);
         setReferences(data.references || []);
       }
-    } catch (error) {
-      console.error(error);
-      alert('请求失败，请稍后重试');
+    } catch (error: any) {
+      console.error('Fetch error:', error);
+      alert(error.name === 'AbortError' ? '请求超时' : '请求失败');
     } finally {
+      clearTimeout(timeoutId);
       setIsAsking(false);
     }
   };
@@ -239,7 +252,7 @@ export default function Home() {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".md,.txt,.pdf,.docx,.xlsx,.xls"
+            accept=".md,.txt,.docx,.xlsx,.xls"
             multiple
             onChange={handleFileUpload}
             className="hidden"
@@ -425,6 +438,17 @@ export default function Home() {
                     return part;
                   })}
                 </div>
+              </div>
+            )}
+
+            {/* 加载状态 */}
+            {isAsking && (
+              <div className="mb-3 p-3 bg-blue-50 border border-blue-200 rounded-lg flex items-center gap-2">
+                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                </svg>
+                <span className="text-sm text-blue-600">AI 思考ing...</span>
               </div>
             )}
 

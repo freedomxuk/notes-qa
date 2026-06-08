@@ -1,6 +1,6 @@
 /**
  * 文件解析接口
- * 支持 PDF、Word、Excel 解析为纯文本
+ * 支持 txt、md、docx、xlsx 格式
  */
 
 import mammoth from "mammoth";
@@ -20,11 +20,19 @@ export async function POST(request: Request) {
     const ext = file.name.split(".").pop()?.toLowerCase();
     let content = "";
 
-    if (ext === "docx") {
-      const buffer = await file.arrayBuffer();
-      const result = await mammoth.extractRawText({ arrayBuffer: buffer });
+    if (ext === "pdf") {
+      // PDF 不支持，请用户复制内容保存为 txt
+      return Response.json({
+        error: "暂不支持 PDF 格式。请将 PDF 内容复制保存为 .txt 文件后上传。"
+      }, { status: 400 });
+    } else if (ext === "docx") {
+      // Word 解析 - 需要 { buffer: Buffer } 格式
+      const arrayBuffer = await file.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      const result = await mammoth.extractRawText({ buffer });
       content = result.value;
     } else if (ext === "xlsx" || ext === "xls") {
+      // Excel 解析
       const buffer = await file.arrayBuffer();
       const workbook = XLSX.read(buffer, { type: "buffer" });
       for (const sheetName of workbook.SheetNames) {
@@ -33,8 +41,7 @@ export async function POST(request: Request) {
         content += XLSX.utils.sheet_to_csv(sheet) + "\n";
       }
     } else {
-      // 纯文本：包括 .txt, .md, .pdf 等
-      // PDF 作为纯文本读取（会有乱码，但不会报错）
+      // 纯文本：.txt, .md 等
       content = await file.text();
     }
 

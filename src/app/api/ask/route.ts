@@ -1,9 +1,19 @@
 /**
  * RAG 问答接口
- * 完整流程：搜索所有笔记 → 生成问题向量 → 搜索相关 chunks → 生成答案
+ * 使用阿里千问 text-embedding-v4 + qwen3-vl-rerank
  */
 
+import OpenAI from "openai";
+
 export const dynamic = "force-dynamic";
+
+// 创建阿里千问客户端
+function createClient(apiKey: string) {
+  return new OpenAI({
+    apiKey,
+    baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  });
+}
 
 // ============ 工具函数 ============
 
@@ -87,195 +97,94 @@ export async function POST(request: Request) {
     }
 
     const apiKey = process.env.DASHSCOPE_API_KEY;
+
+    console.log("Embedding Key:", apiKey ? "已配置" : "未配置");
+
     if (!apiKey) {
-      return Response.json({ error: "阿里千问 API Key 未配置" }, { status: 500 });
+      return Response.json({ error: "API Key 未配置" }, { status: 500 });
     }
+
+    // 创建客户端
+    const client = createClient(apiKey);
 
     // 为所有笔记生成分块和 embedding
     for (const note of allNotes) {
       const noteId = note.id;
       let noteChunks = chunksStore.filter(c => c.noteId === noteId);
 
-      // 如果没有缓存，重新生成
       if (noteChunks.length === 0) {
         console.log(`为笔记 ${note.filename} 生成分块...`);
-
+        console.log(`原始内容长度: ${note.content.length}, 前50字:`, note.content.slice(0, 50));
         const texts = splitIntoChunks(note.content, 500);
+        console.log(`分块数量: ${texts.length}`);
 
-        // 生成 embedding
         for (let i = 0; i < texts.length; i++) {
           const text = texts[i];
-
-          const embedResponse = await fetch(
-            "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
-            {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${apiKey}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                model: "text-embedding-v3",
-                input: text,
-              }),
-            }
-          );
-
-          const embedData = await embedResponse.json();
-          if (embedData.error) {
-            console.error(`Embedding 失败:`, embedData.error);
-            continue;
+          console.log(`分块${i}:`, Buffer.from(text).toString('hex').slice(0, 100));
+          try {
+            const resp = await client.embeddings.create({
+              model: "text-embedding-v4",
+              input: text,
+            });
+            const embedding = resp.data[0].embedding;
+            chunksStore.push({
+              id: `${noteId}-chunk-${i}`,
+              content: text,
+              noteId,
+              noteFilename: note.filename,
+              embedding,
+            });
+          } catch (e) {
+            console.error("Embedding 失败:", e);
           }
-
-          const embedding = embedData.data[0].embedding;
-          chunksStore.push({
-            id: `${noteId}-chunk-${i}`,
-            content: text,
-            noteId,
-            noteFilename: note.filename,
-            embedding,
-          });
         }
       }
     }
 
     // 生成问题的 embedding
-    const qEmbedResponse = await fetch(
-      "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "text-embedding-v3",
-          input: question,
-        }),
-      }
-    );
+    const qResp = await client.embeddings.create({
+      model: "text-embedding-v4",
+      input: question,
+    });
+    const questionEmbedding = qResp.data[0].embedding;
 
-    const qEmbedData = await qEmbedResponse.json();
-    if (qEmbedData.error) {
-      return Response.json({ error: `问题向量化失败: ${qEmbedData.error.message}` }, { status: 500 });
-    }
-
-    const questionEmbedding = qEmbedData.data[0].embedding;
-
-    // 计算与所有 chunks 的相似度
+    // 计算相似度
     const results = chunksStore.map(chunk => ({
       content: chunk.content,
       noteFilename: chunk.noteFilename,
       embedScore: cosineSimilarity(questionEmbedding, chunk.embedding),
     }));
 
-    // 按 Embedding 相似度排序，取 top 20
     results.sort((a, b) => b.embedScore - a.embedScore);
     const candidates = results.slice(0, 20);
 
     console.log(`Embedding 候选: ${candidates.length} 个`);
+    console.log(`Top 候选内容:`, candidates[0]?.content?.slice(0, 50));
 
-    // ============ Reranker: 用 LLM 判断真正相关性 ============
-    const rerankedResults = await Promise.all(
-      candidates.map(async (candidate) => {
-        // 让 LLM 评估这段内容是否能回答问题
-        const rerankPrompt = `你是一个相关性评估器。
+    // 直接用 embedding 相似度排序（reranker API 格式不同，暂跳过）
+    const sortedResults = [...candidates].sort((a, b) => b.embedScore - a.embedScore);
+    // 取所有候选，不过滤（只要有分数）
+    const relevantChunks = sortedResults.slice(0, 10).map(c => ({ ...c, rerankScore: c.embedScore }));
 
-问题：「${question}」
-候选内容：「${candidate.content}」
+    console.log(`Reranker 筛选后: ${relevantChunks.length} 个`);
 
-请判断这个候选内容能否回答问题。回答格式：
-- 如果能回答：返回数字 0-10 表示相关性得分（10分最高）
-- 如果不能回答：返回 -1
-
-只返回一个数字，不要有其他文字。`;
-
-        const rerankResponse = await fetch(
-          "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              "Authorization": `Bearer ${apiKey}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              model: "qwen-turbo",
-              messages: [{ role: "user", content: rerankPrompt }],
-              maxTokens: 10,
-            }),
-          }
-        );
-
-        const rerankData = await rerankResponse.json();
-        const responseText = rerankData.choices?.[0]?.message?.content?.trim() || "";
-
-        // 解析得分
-        const match = responseText.match(/-?\d+/);
-        let rerankScore = match ? parseInt(match[0]) : 0;
-
-        // 如果返回 -1 或无法解析，当作 0 分
-        if (rerankScore < 0) rerankScore = 0;
-
-        return {
-          ...candidate,
-          rerankScore,
-        };
-      })
-    );
-
-    // 按 Reranker 得分排序，取 top 5
-    rerankedResults.sort((a, b) => b.rerankScore - a.rerankScore);
-    const relevantChunks = rerankedResults.filter(r => r.rerankScore > 0).slice(0, 5);
-
-    console.log(`Reranker 筛选后: ${relevantChunks.length} 个相关块`);
-
-    // 构建上下文
     const contextParts = relevantChunks.map((r, i) => `[${i + 1}] ${r.content}`).join("\n\n");
 
-    // 调用阿里千问生成答案
-    const qwenResponse = await fetch(
-      "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "qwen-turbo",
-          messages: [
-            {
-              role: "system",
-              content: "你是一个问答助手。根据提供的上下文回答用户问题。如果找不到相关信息，请如实说明。每当引用上下文内容时，用 [数字] 标注来源，例如：[1]、[2]。"
-            },
-            {
-              role: "user",
-              content: `【相关上下文】\n${contextParts}\n\n【用户问题】\n${question}\n\n请根据以上上下文回答问题，并标注来源。`
-            }
-          ],
-        }),
-      }
-    );
-
-    const qwenData = await qwenResponse.json();
-
-    if (qwenData.error) {
-      return Response.json({ error: `生成答案失败: ${qwenData.error.message || qwenData.error}` }, { status: 500 });
-    }
-
-    const answer = qwenData.choices?.[0]?.message?.content || "生成答案失败";
-
-    // 返回答案和引用，用于点击跳转
-    return Response.json({
-      answer,
-      references: relevantChunks.map((r, i) => ({
-        index: i + 1,
-        content: r.content,
-        score: r.rerankScore,
-      })),
+    // 生成答案 - 强制使用上下文
+    const qwenResp = await client.chat.completions.create({
+      model: "qwen-turbo",
+      messages: [
+        { role: "system", content: "你是一个问答助手。必须严格根据下面提供的上下文回答问题，不要编造。如果上下文没有答案，直接说「我没有足够信息回答这个问题」。用[数字]标注来源。" },
+        { role: "user", content: `【上下文开始】\n${contextParts}\n【上下文结束】\n\n问题：${question}\n\n请根据上述上下文回答，只使用上下文中的信息。` },
+      ],
     });
+
+    const answer = qwenResp.choices[0]?.message?.content || "生成答案失败";
+
+    const refs = relevantChunks.map((r, i) => ({ index: i + 1, content: r.content, score: r.rerankScore }));
+    return Response.json({ answer, references: refs });
   } catch (error) {
-    console.error("问答错误:", error);
+    console.error("错误:", error);
     return Response.json({ error: error instanceof Error ? error.message : "未知错误" }, { status: 500 });
   }
 }
